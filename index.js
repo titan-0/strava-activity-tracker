@@ -78,6 +78,30 @@ function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
+// Append rows to Google Sheet. Each activity row will be:
+// [userId, activity_id, name, type, distance, moving_time, elapsed_time, start_date]
+async function appendActivitiesToSheet(rows) {
+  if (!GOOGLE_SHEET_ID) {
+    console.warn('GOOGLE_SHEET_ID not set — skipping Sheets append.');
+    return;
+  }
+
+  const sheets = getSheetsClient();
+  const sheetName = process.env.GOOGLE_SHEET_NAME || 'Sheet1';
+  try {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `${sheetName}!A1`,
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: rows }
+    });
+    console.log(`Appended ${rows.length} rows to Google Sheet (${sheetName}).`);
+  } catch (err) {
+    console.error('Failed to append to Google Sheet:', err.message || err);
+  }
+}
+
 // OAuth redirect
 app.get('/auth/strava', (req, res) => {
   const scope = 'activity:read_all';
@@ -160,11 +184,12 @@ app.post('/fetch-activities', async (req, res) => {
     });
 
     const activities = actResp.data;
-//     
-for (const act of activities) {
-      await ActivityModel.findOneAndUpdate(
-        { activity_id: act.id },
-        {
+
+    const newActivities = [];
+    for (const act of activities) {
+      const exists = await ActivityModel.findOne({ activity_id: act.id });
+      if (!exists) {
+        await ActivityModel.create({
           userId,
           activity_id: act.id,
           name: act.name,
@@ -173,12 +198,45 @@ for (const act of activities) {
           elapsed_time: act.elapsed_time,
           start_date: act.start_date,
           type: act.type,
-        },
-        { upsert: true }
+        });
+        newActivities.push(act);
+      } else {
+        // keep record up-to-date
+        await ActivityModel.findOneAndUpdate(
+          { activity_id: act.id },
+          {
+            userId,
+            name: act.name,
+            distance: act.distance,
+            moving_time: act.moving_time,
+            elapsed_time: act.elapsed_time,
+            start_date: act.start_date,
+            type: act.type,
+          }
+        );
+      }
+    }
+
+    // If there are newly created activities, append them to Google Sheets
+    if (newActivities.length > 0) {
+      const rows = newActivities.map(a => [
+        userId,
+        a.id,
+        a.name,
+        a.type,
+        a.distance,
+        a.moving_time,
+        a.elapsed_time,
+        a.start_date
+      ]);
+
+      // Fire-and-forget but log errors
+      appendActivitiesToSheet(rows).catch(err =>
+        console.error('Error appending activities to sheet:', err)
       );
     }
 
-    return res.send({ inserted: activities.length });
+    return res.send({ inserted: activities.length, newInserted: newActivities.length });
   } catch (err) {
     console.error('Fetch/write failed:', err.response?.data || err);
     return res.status(500).send('Failed to fetch or store activities');
